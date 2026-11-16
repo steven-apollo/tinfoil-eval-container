@@ -1,16 +1,57 @@
-# Tinfoil Container Configuration
-# For updates: edit this file, commit, run the workflow (e.g., v0.0.2)
+# Tinfoil Container Configuration: 1-GPU confidential-compute benchmark
 cvm-version: 0.14.7
-cpus: 2
-memory: 8192
+cpus: 16
+memory: 65536
+gpus: 1
 
 containers:
-  - name: "hello-world"
-    image: "ghcr.io/tinfoilsh/tinfoil-containers-hello-world@sha256:c943b1cab16409e2e686ad71deab30364c27421852cdd6b3080df1c7a38331ed"
-    env:
-      - MESSAGE: "Hello from Tinfoil"
+  - name: "gpu-bench"
+    image: "docker.io/pytorch/pytorch@sha256:7b324d212a4450795b49edba9949b7cdc72429148a64e974334bfe5774d51385"
+    runtime: nvidia
+    gpus: all
+    restart: always
+    tmpfs:
+      - "/tmp:size=2g,mode=1777,exec"
+      - "/root:size=2g,mode=0700,exec"
+    command:
+      - python
+      - -c
+      - |
+        import json, subprocess, time, http.server, torch
+        def sync(): torch.cuda.synchronize()
+        def bench():
+            d = torch.device("cuda"); p = torch.cuda.get_device_properties(0)
+            out = {"device": p.name, "mem_gb": round(p.total_memory / 2**30, 1), "torch": torch.__version__, "cuda": torch.version.cuda}
+            try: out["conf_compute"] = subprocess.run(["nvidia-smi", "conf-compute", "-f"], capture_output=True, text=True, timeout=20).stdout.strip()
+            except Exception as e: out["conf_compute"] = f"nvidia-smi unavailable: {e}"
+            n = 8192; a = torch.randn(n, n, device=d, dtype=torch.bfloat16); b = torch.randn(n, n, device=d, dtype=torch.bfloat16)
+            for _ in range(5): a @ b
+            sync(); t = time.perf_counter(); it = 50
+            for _ in range(it): a @ b
+            sync(); out["matmul_bf16_tflops"] = round(2 * n**3 * it / (time.perf_counter() - t) / 1e12, 1)
+            size = 1 << 30
+            for name, pin in (("pinned", True), ("pageable", False)):
+                h = torch.empty(size, dtype=torch.uint8, pin_memory=pin); g = torch.empty(size, dtype=torch.uint8, device=d)
+                g.copy_(h); sync(); t = time.perf_counter()
+                for _ in range(5): g.copy_(h)
+                sync(); out[f"h2d_{name}_gbps"] = round(5 * size / (time.perf_counter() - t) / 1e9, 2)
+                t = time.perf_counter()
+                for _ in range(5): h.copy_(g)
+                sync(); out[f"d2h_{name}_gbps"] = round(5 * size / (time.perf_counter() - t) / 1e9, 2)
+            return out
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps(bench() if self.path.startswith("/bench") else {"ok": True}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+        http.server.HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10m
 
 shim:
   upstream-port: 8080
   paths:
-    - /*
+    - /bench
+    - /health
